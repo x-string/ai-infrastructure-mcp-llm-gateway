@@ -6,7 +6,7 @@ The subpackages never import each other.
 
 | Task | Package | What it does | Status |
 |---|---|---|---|
-| 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | In progress: strict input schemas |
+| 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | In progress: server and error mapping done, stdio entry point next |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Planned |
 | 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Planned |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
@@ -55,8 +55,19 @@ uv run ruff check                    # lint
 
 ## Task 1: MCP server with strict validation
 
-Status: strict input schemas are done (`src/ai_gateway/mcp_server/schemas.py`). The MCP server and the stdio
-entry point come next.
+Status: the tool models (`schemas.py`) and the MCP server with its error mapping (`server.py`) are done.
+The stdio entry point comes next.
+
+Tools:
+
+- **`get_customer_record`**: returns the customer's profile as structured content.
+- **`trigger_refund`**: records a refund and returns a receipt.
+
+Both tools publish their input and output JSON Schemas and behavior hints (read-only or not) in
+`tools/list`. The input schema is generated from the same Pydantic model that validates each call, so
+what clients see is exactly what the server enforces.
+
+### Validation rules
 
 | Argument | Rule | Rejected examples |
 |---|---|---|
@@ -65,13 +76,37 @@ entry point come next.
 | `reason` | string of 10 to 1,000 characters, no leading or trailing whitespace | `"012345678"`, `"          "`, `" refund requested"`, `1234567890` |
 | any other key | not allowed (`additionalProperties: false`) | `{"approved_by": "me"}` |
 
-Invalid arguments are reported without echoing the submitted values. Each error carries only the field name, a
-message and an error type.
+### Error mapping
+
+| Situation | Response |
+|---|---|
+| Arguments fail validation (format, type, missing or unknown key) | JSON-RPC error `-32602 Invalid params` with `data: {tool, errors: [{field, message, type}]}` |
+| Unknown tool | JSON-RPC error `-32602 Unknown tool: <name>` |
+| Valid arguments, but no such customer | Tool result with `isError: true` (a business outcome, not a protocol error) |
+| Any unexpected exception | JSON-RPC error `-32603 Internal error`; the details go to the server log only |
+
+Example: `trigger_refund` called with `{"customer_id": "CUST-00042", "amount": -5, "reason": "duplicate charge"}`
+returns
+
+```json
+{"jsonrpc": "2.0", "id": 7, "error": {"code": -32602, "message": "Invalid params", "data": {"tool": "trigger_refund",
+ "errors": [{"field": "amount", "message": "Input should be greater than 0", "type": "greater_than"}]}}}
+```
+
+Error details never echo submitted values. The names of unexpected keys are shown only when they look like
+ordinary identifiers. Unexpected exceptions are wrapped explicitly: without that, the SDK would answer stdio
+clients with `{"code": 0, "message": "<exception text>"}`, which leaks internals. A test reproduces that leak.
 
 ## Requirements versus implementation choices
 
 The assessment leaves some details open. These are the choices made, and why:
 
+- **Invalid tool arguments are JSON-RPC errors (`-32602`), as the brief requires.** Recent MCP spec
+  revisions (2025-11-25 onward) suggest reporting input-validation failures as `isError` tool results so
+  the model can self-correct. The SDK's high-level `MCPServer` does exactly that, which is why this server
+  uses the low-level `Server`. The spec itself is not consistent here: its 2026-07-28 `InvalidParamsError`
+  definition still lists invalid tool arguments under `-32602`. Unknown tools are `-32602` in every
+  revision.
 - **`CUST-XXXXX` means five ASCII digits.** The pattern uses `[0-9]`, not `\d`, because `\d` also matches non-ASCII
   digits such as `١٢٣٤٥`, both in Python's `re` and in pydantic's regex engine.
 - **No type coercion.** `"10.5"` and `true` are not accepted as amounts. JSON integers are accepted because JSON has

@@ -1,6 +1,6 @@
-r"""Strict input models for the Task 1 MCP tools.
+r"""Input and output models for the Task 1 MCP tools.
 
-These models are the only validation logic. The server publishes ``Model.model_json_schema()``
+The input models are the only validation logic. The server publishes ``Model.model_json_schema()``
 as each tool's ``inputSchema`` and validates incoming arguments with the same model, so the schema
 clients see is exactly what the server enforces.
 
@@ -19,7 +19,8 @@ Strictness choices:
 from __future__ import annotations
 
 import re
-from typing import Annotated, Final
+from datetime import datetime
+from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -76,6 +77,31 @@ class TriggerRefundInput(StrictModel):
             examples=["Duplicate charge on invoice INV-2041"],
         ),
     ]
+
+
+class CustomerRecord(BaseModel):
+    """Result of ``get_customer_record``, also published as the tool's ``outputSchema``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    customer_id: str
+    name: str
+    email: str
+    tier: Literal["standard", "premium"]
+    status: Literal["active", "suspended"]
+
+
+class RefundReceipt(BaseModel):
+    """Result of ``trigger_refund``, also published as the tool's ``outputSchema``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    refund_id: str
+    customer_id: str
+    amount: float
+    reason: str
+    status: Literal["accepted"]
+    created_at: datetime
 
 
 _SAFE_FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")

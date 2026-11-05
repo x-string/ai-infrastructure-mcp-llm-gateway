@@ -5,6 +5,7 @@ description = "MCP server, MCP security gateway, streaming PII-redaction LLM gat
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "mcp~=2.3.0",
     "pydantic>=2.12,<3",
 ]
 
@@ -20,6 +21,7 @@ minversion = "9.0"
 testpaths = ["tests"]
 addopts = ["-ra"]
 strict = true
+anyio_mode = "auto"
 markers = [
     "e2e: starts subprocesses or real servers",
     "slow: timing-sensitive or multi-process tests",
@@ -35,6 +37,7 @@ select = ["E", "W", "F", "I", "B", "UP", "T20"]
 
 [dependency-groups]
 dev = [
+    "anyio>=4.16",
     "pytest>=9.2",
     "ruff>=0.17.4",
 ]
