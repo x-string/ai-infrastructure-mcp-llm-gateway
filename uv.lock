@@ -13,6 +13,7 @@ source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
+    { name = "pyjwt" },
 ]
 
 [package.dev-dependencies]
@@ -26,6 +27,7 @@ dev = [
 requires-dist = [
     { name = "mcp", specifier = "~=2.3.0" },
     { name = "pydantic", specifier = ">=2.12,<3" },
+    { name = "pyjwt", specifier = ">=2.15" },
 ]
 
 [package.metadata.requires-dev]
