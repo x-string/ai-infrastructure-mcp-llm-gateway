@@ -1,8 +1,8 @@
 # AI infrastructure: MCP server, MCP security gateway and LLM gateways
 
-Four independent services built for the AI Field Developer / Solutions Engineer assessment
-([assessment.pdf](assessment.pdf)). Each task has its own subpackage and test folder, and runs on its own.
-The subpackages never import each other.
+Four independent services built for an AI Field Developer / Solutions Engineer technical assessment. The
+brief itself is not included in this repository. Each task has its own subpackage and test folder, and runs on
+its own. The subpackages never import each other.
 
 | Task | Package | What it does | Status |
 |---|---|---|---|

@@ -22,5 +22,8 @@ htmlcov/
 *.db-shm
 *.sqlite3
 
+# Assessment brief (kept out of the repository)
+assessment.pdf
+
 # OS
 .DS_Store
