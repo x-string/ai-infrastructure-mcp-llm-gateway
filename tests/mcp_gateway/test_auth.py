@@ -8,6 +8,7 @@ import hmac
 import json
 import time
 import warnings
+from collections.abc import Callable
 from typing import Any
 
 import jwt
@@ -26,17 +27,23 @@ from ai_gateway.mcp_gateway.auth import (
 SECRET = "gateway-test-secret-0123456789abcdef"
 SETTINGS = TokenSettings(secret=SECRET, audience="mcp-gateway")
 VERIFIER = TokenVerifier(SETTINGS)
-NOW = int(time.time())
 DROP = object()
 
 
+def now() -> int:
+    # Read the clock when a token is built, not at import: the verifier checks the time claims
+    # against the clock when the test runs, which can be long after collection.
+    return int(time.time())
+
+
 def claims(**overrides: Any) -> dict[str, Any]:
+    issued_at = now()
     base: dict[str, Any] = {
         "sub": "alice",
         "role": "viewer",
         "aud": "mcp-gateway",
-        "iat": NOW,
-        "exp": NOW + 300,
+        "iat": issued_at,
+        "exp": issued_at + 300,
     }
     base.update(overrides)
     return {key: value for key, value in base.items() if value is not DROP}
@@ -96,7 +103,7 @@ def test_scheme_is_case_insensitive() -> None:
 
 
 def test_small_clock_skew_is_tolerated() -> None:
-    token = sign(claims(exp=NOW - 5))  # within the 10-second leeway
+    token = sign(claims(exp=now() - 5))  # within the 10-second leeway
     assert VERIFIER.authenticate(bearer(token)).subject == "alice"
 
 
@@ -121,36 +128,41 @@ def test_missing_credentials_get_a_plain_challenge(headers: list[str]) -> None:
 
 # --- invalid tokens: 401 with error="invalid_token" ----------------------------------------------
 
+# Each case builds its headers when the test runs, so time-based claims stay relative to the clock.
 INVALID_TOKENS = [
-    pytest.param(["Bearer a.b.c", "Bearer a.b.c"], id="two-authorization-headers"),
-    pytest.param(bearer("not-a-jwt"), id="garbage"),
-    pytest.param(["Bearer abc def"], id="space-in-token"),
-    pytest.param(bearer("a" * 9000), id="oversized"),
-    pytest.param(bearer(sign(claims(), secret="another-secret-0123456789abcdefgh")), id="bad-sig"),
-    pytest.param(bearer(sign(claims(exp=NOW - 60))), id="expired"),
-    pytest.param(bearer(sign(claims(nbf=NOW + 60))), id="not-yet-valid"),
-    pytest.param(bearer(sign(claims(iat=NOW + 60))), id="issued-in-future"),
-    pytest.param(bearer(sign(claims(exp=DROP))), id="missing-exp"),
-    pytest.param(bearer(sign(claims(iat=DROP))), id="missing-iat"),
-    pytest.param(bearer(sign(claims(sub=DROP))), id="missing-sub"),
-    pytest.param(bearer(sign(claims(aud=DROP))), id="missing-aud"),
-    pytest.param(bearer(sign(claims(role=DROP))), id="missing-role"),
-    pytest.param(bearer(sign(claims(aud="another-service"))), id="wrong-audience"),
-    pytest.param(bearer(sign(claims(sub=123))), id="non-string-subject"),
-    pytest.param(bearer(sign(claims(role="root"))), id="unknown-role"),
-    pytest.param(bearer(sign(claims(role="ADMIN"))), id="role-wrong-case"),
-    pytest.param(bearer(sign(claims(role=["admin"]))), id="role-list"),
-    pytest.param(bearer(sign(claims(role=1))), id="role-number"),
-    pytest.param(bearer(sign_hs512(claims())), id="hs512"),
+    pytest.param(lambda: ["Bearer a.b.c", "Bearer a.b.c"], id="two-authorization-headers"),
+    pytest.param(lambda: bearer("not-a-jwt"), id="garbage"),
+    pytest.param(lambda: ["Bearer abc def"], id="space-in-token"),
+    pytest.param(lambda: bearer("a" * 9000), id="oversized"),
     pytest.param(
-        bearer(forged({"alg": "none"}, claims(role="admin"), signed=False)), id="alg-none"
+        lambda: bearer(sign(claims(), secret="another-secret-0123456789abcdefgh")), id="bad-sig"
     ),
-    pytest.param(bearer(forged({"alg": "RS256"}, claims(role="admin"), signed=True)), id="rs256"),
+    pytest.param(lambda: bearer(sign(claims(exp=now() - 60))), id="expired"),
+    pytest.param(lambda: bearer(sign(claims(nbf=now() + 60))), id="not-yet-valid"),
+    pytest.param(lambda: bearer(sign(claims(iat=now() + 60))), id="issued-in-future"),
+    pytest.param(lambda: bearer(sign(claims(exp=DROP))), id="missing-exp"),
+    pytest.param(lambda: bearer(sign(claims(iat=DROP))), id="missing-iat"),
+    pytest.param(lambda: bearer(sign(claims(sub=DROP))), id="missing-sub"),
+    pytest.param(lambda: bearer(sign(claims(aud=DROP))), id="missing-aud"),
+    pytest.param(lambda: bearer(sign(claims(role=DROP))), id="missing-role"),
+    pytest.param(lambda: bearer(sign(claims(aud="another-service"))), id="wrong-audience"),
+    pytest.param(lambda: bearer(sign(claims(sub=123))), id="non-string-subject"),
+    pytest.param(lambda: bearer(sign(claims(role="root"))), id="unknown-role"),
+    pytest.param(lambda: bearer(sign(claims(role="ADMIN"))), id="role-wrong-case"),
+    pytest.param(lambda: bearer(sign(claims(role=["admin"]))), id="role-list"),
+    pytest.param(lambda: bearer(sign(claims(role=1))), id="role-number"),
+    pytest.param(lambda: bearer(sign_hs512(claims())), id="hs512"),
+    pytest.param(
+        lambda: bearer(forged({"alg": "none"}, claims(role="admin"), signed=False)), id="alg-none"
+    ),
+    pytest.param(
+        lambda: bearer(forged({"alg": "RS256"}, claims(role="admin"), signed=True)), id="rs256"
+    ),
 ]
 
 
-@pytest.mark.parametrize("headers", INVALID_TOKENS)
-def test_invalid_tokens_are_rejected(headers: list[str]) -> None:
-    error = failure(headers)
+@pytest.mark.parametrize("make_headers", INVALID_TOKENS)
+def test_invalid_tokens_are_rejected(make_headers: Callable[[], list[str]]) -> None:
+    error = failure(make_headers())
     assert error.token_present is True
     assert SECRET not in error.reason
