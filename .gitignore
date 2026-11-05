@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments and local configuration (secrets live in .env, never in git)
+.venv/
+.env
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Local data (Task 4 SQLite database and its WAL files)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# OS
+.DS_Store

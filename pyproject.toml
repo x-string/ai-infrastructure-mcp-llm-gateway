@@ -1,0 +1,40 @@
+[project]
+name = "ai-infrastructure-mcp-llm-gateway"
+version = "0.1.0"
+description = "MCP server, MCP security gateway, streaming PII-redaction LLM gateway and token-aware model router."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.12,<3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ai_gateway"
+
+[tool.pytest]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra"]
+strict = true
+markers = [
+    "e2e: starts subprocesses or real servers",
+    "slow: timing-sensitive or multi-process tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "T20"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "ruff>=0.17.4",
+]
