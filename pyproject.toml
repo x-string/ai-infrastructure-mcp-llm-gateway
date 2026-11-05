@@ -5,13 +5,18 @@ description = "MCP server, MCP security gateway, streaming PII-redaction LLM gat
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.162,<0.163",
+    "httpx2>=2.16,<3",
     "mcp~=2.3.0",
     "pydantic>=2.12,<3",
     "pyjwt>=2.15",
+    "uvicorn>=0.54",
 ]
 
 [project.scripts]
 t1-mcp-server = "ai_gateway.mcp_server.__main__:main"
+t2-gateway = "ai_gateway.mcp_gateway.__main__:main"
+t2-mint-jwt = "ai_gateway.mcp_gateway.mint_jwt:main"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13"]

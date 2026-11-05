@@ -7,7 +7,7 @@ its own. The subpackages never import each other.
 | Task | Package | What it does | Status |
 |---|---|---|---|
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
-| 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | In progress: parsing, authentication and policy done, HTTP proxy next |
+| 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | In progress: gateway and proxy done, real downstream and end-to-end tests next |
 | 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Planned |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
 
