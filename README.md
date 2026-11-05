@@ -7,7 +7,7 @@ its own. The subpackages never import each other.
 | Task | Package | What it does | Status |
 |---|---|---|---|
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
-| 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | In progress: gateway and proxy done, real downstream and end-to-end tests next |
+| 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Done |
 | 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Planned |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
 
@@ -147,6 +147,93 @@ malformed lines; the end-to-end tests cover each behavior):
 | Plain `stdio_server()` | 11 to 12 of 20 | 0 of 2 (the client waits forever) | Yes |
 | This transport | 20 of 20 | 2 of 2 | No |
 
+## Task 2: MCP security gateway
+
+An HTTP reverse proxy in front of an MCP server. It reads the bearer token, extracts the caller's role, and inspects
+every JSON-RPC message before deciding whether to forward it.
+
+### Run it
+
+```bash
+cp .env.example .env                       # then set GATEWAY_JWT_SECRET, for example to $(openssl rand -hex 32)
+uv run t2-mock-downstream                  # demo MCP server (official SDK) on 127.0.0.1:8001
+uv run --env-file .env t2-gateway          # the gateway on 127.0.0.1:8000
+VIEWER=$(uv run --env-file .env t2-mint-jwt --role viewer --subject alice)
+ADMIN=$(uv run --env-file .env t2-mint-jwt --role admin --subject root)
+
+mcp() { curl -s http://127.0.0.1:8000/mcp -H "authorization: Bearer $1" \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$2"; }
+mcp "$VIEWER" '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+mcp "$VIEWER" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"admin_reset_key","arguments":{"key_id":"k-1"}}}'
+mcp "$ADMIN"  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"admin_reset_key","arguments":{"key_id":"k-1"}}}'
+```
+
+The viewer's admin call is answered by the gateway and never reaches the downstream server:
+
+```json
+{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Unauthorized Tool Call",
+ "data":{"reason":"forbidden_tool","tool":"admin_reset_key","required_role":"admin"}}}
+```
+
+The official MCP client works unchanged; the token goes on its HTTP client:
+
+```python
+async with httpx2.AsyncClient(headers={"authorization": f"Bearer {token}"}) as http:
+    async with Client(streamable_http_client("http://127.0.0.1:8000/mcp", http_client=http)) as client:
+        await client.call_tool("admin_reset_key", {"key_id": "k-1"})  # MCPError -32001 for a viewer
+```
+
+The demo downstream is a stateless MCP server with the tools `echo`, `get_status`, `slow_echo`, `admin_reset_key` and
+`admin_delete_user`. Pass `--sse` to make it answer with event streams.
+
+### How a request is handled
+
+| Step | Rejected with |
+|---|---|
+| 1. An `Origin` header, if present, must be allow-listed (DNS-rebinding protection) | 403 |
+| 2. `Authorization: Bearer <JWT>`: HS256 only; `exp`, `iat`, `sub`, `aud` and `role` required | 401 with a `WWW-Authenticate` challenge |
+| 3. `Content-Type: application/json`, body at most 1 MiB | 415 / 413 |
+| 4. Strict JSON-RPC parsing: exactly one request or notification | `-32700` / `-32600` (HTTP 400) |
+| 5. 2026-07-28 clients: the `Mcp-Method` and `Mcp-Name` headers must match the body | `-32020` (HTTP 400) |
+| 6. Policy: method allowlist and the `admin_` rule | `-32601`, `-32602` or `-32001` |
+| 7. Forward: the message is rebuilt from the parsed fields, and the reply streams back as it arrives | 502 / 504 if the downstream fails |
+
+Every decision is written to an audit log (subject, role, method, tool, decision). Tokens are never logged.
+
+### Authorization rules
+
+- `tools/list` is forwarded unfiltered for any authenticated role, as the brief requires.
+- A `tools/call` for a tool whose name starts with `admin_` needs the `admin` role. Otherwise the gateway answers
+  `-32001 Unauthorized Tool Call` itself. The prefix is compared case-insensitively, so `ADMIN_reset_key` fails closed.
+- Tool names must use MCP tool-name characters (`[A-Za-z0-9_.-]`, up to 128). That rules out whitespace and Unicode
+  look-alikes such as a fullwidth `ａｄｍｉｎ_`.
+- Only `initialize`, `ping`, `server/discover`, `tools/list`, `tools/call` and the lifecycle notifications pass.
+  Anything else is `-32601`. A `tools/call` sent without an `id` (which would run with no reply) is rejected.
+
+### Hardening against bypasses
+
+| Attack | Defense |
+|---|---|
+| Duplicate keys: `{"name": "get_status", "name": "admin_reset_key"}` | Rejected (`-32700`): JSON parsers disagree on which value wins |
+| A batch with an admin call inside | Rejected (`-32600`): MCP no longer supports batching |
+| A "response" that also has a method: `{"result": {}, "method": "tools/call", ...}` | Rejected (`-32600`): the SDK downstream ignores the extra keys and would run it as a request |
+| Headers naming one tool while the body names another (2026-07-28) | Rejected (`-32020`), using the SDK's own checks |
+| Reusing the client's token against the downstream | The `Authorization` header is never forwarded (MCP forbids token passthrough) |
+| Bytes that differ from what was checked | The forwarded body is rebuilt from the parsed message |
+
+### Tested end to end
+
+`tests/mcp_gateway/test_e2e.py` starts the real gateway and the SDK downstream as processes, and drives them with
+the official MCP client over TCP, in both protocol eras (2025-11-25 and 2026-07-28) and both downstream modes (JSON
+and SSE). It covers:
+
+- unfiltered tool listing;
+- `-32001` for viewers, with the downstream's own call log confirming nothing arrived;
+- admin calls;
+- 401 for missing or invalid tokens;
+- a tool that runs longer than 5 seconds;
+- a client hang-up that cancels the downstream tool.
+
 ## Requirements versus implementation choices
 
 The assessment leaves some details open. These are the choices made, and why:
@@ -165,6 +252,19 @@ The assessment leaves some details open. These are the choices made, and why:
   expressible in the published JSON Schema (`minLength` plus `pattern`).
 - **`amount` follows the brief literally: positive and finite.** A maximum amount or a two-decimal rule would be
   business rules the brief does not state, so they are not enforced.
+- **Gateway tokens are HS256-signed JWTs with a `role` claim.** This is one way to "extract the user's role" from a
+  bearer token. `t2-mint-jwt` mints development tokens; in production an identity provider would issue them, and
+  OAuth discovery (RFC 9728 protected-resource metadata) is out of scope here.
+- **`-32001` is returned with HTTP 200.** The error stays inside the JSON-RPC response, so the official MCP client
+  raises `MCPError(-32001)`. An HTTP 403 would make MCP clients start an OAuth step-up flow instead. The code itself
+  is what the brief asks for. Note that the 2026-07-28 spec marks `-32000` to `-32019` as a legacy range, and the
+  Python SDK uses `-32001` for its own local request timeouts. The stable `data.reason = "forbidden_tool"` tells the
+  two apart.
+- **Methods other than `tools/list` and `tools/call` go through an allowlist.** The brief only defines those two
+  methods. Lifecycle messages are allowed, and everything else is denied (fail closed).
+- **Cancellation on client hang-up depends on the downstream.** The gateway always closes its downstream request
+  when the client disconnects. An SDK server answering with event streams then cancels the tool. In its JSON-response
+  mode, the SDK does not watch for disconnects, so the tool runs to completion.
 
 ## Project layout
 
@@ -175,5 +275,6 @@ src/ai_gateway/
 ├── llm_gateway/    # Task 3
 └── model_router/   # Task 4
 tests/
-└── mcp_server/     # one folder per task, added as each task is built
+├── mcp_server/     # one folder per task, added as each task is built
+└── mcp_gateway/
 ```
