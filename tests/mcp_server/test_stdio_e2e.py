@@ -24,6 +24,15 @@ import pytest
 from mcp import Client, MCPError, StdioServerParameters
 from mcp.types import INVALID_PARAMS, jsonrpc_message_adapter
 
+from tests.mcp_server.edge_cases import (
+    INVALID_AMOUNTS,
+    INVALID_CUSTOMER_IDS,
+    INVALID_REASONS,
+    VALID_AMOUNTS,
+    VALID_CUSTOMER_IDS,
+    VALID_REASONS,
+)
+
 pytestmark = pytest.mark.e2e
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -202,6 +211,58 @@ def test_malformed_input_gets_standard_errors_instead_of_silence() -> None:
             "id": 13,
             "result": {},
         }  # ...so the next reply is the ping
+
+        assert server.close_stdin_and_wait() == 0
+
+    server.assert_stdout_is_pure_jsonrpc()
+
+
+NON_STANDARD_JSON = {
+    "NaN",
+    "Infinity",
+    "-Infinity",
+}  # not JSON at all: the transport answers -32700
+
+EDGE_CASE_TABLE = [
+    *(("get_customer_record", "customer_id", case, False) for case in VALID_CUSTOMER_IDS),
+    *(("get_customer_record", "customer_id", case, True) for case in INVALID_CUSTOMER_IDS),
+    *(("trigger_refund", "amount", case, False) for case in VALID_AMOUNTS),
+    *(("trigger_refund", "amount", case, True) for case in INVALID_AMOUNTS),
+    *(("trigger_refund", "reason", case, False) for case in VALID_REASONS),
+    *(("trigger_refund", "reason", case, True) for case in INVALID_REASONS),
+]
+
+
+def arguments_text(tool: str, field: str, value_json: str) -> str:
+    """Raw JSON text for a tool's arguments, with one field's value spliced in verbatim."""
+    fields = {"customer_id": '"CUST-00042"'}
+    if tool == "trigger_refund":
+        fields |= {"amount": "25.0", "reason": '"Duplicate charge on invoice INV-2041"'}
+    fields[field] = value_json
+    return "{" + ",".join(f'"{key}":{value}' for key, value in fields.items()) + "}"
+
+
+def test_every_shared_edge_case_behaves_the_same_over_the_wire() -> None:
+    with ServerProcess() as server:
+        server.request(INITIALIZE)
+        server.send(INITIALIZED)
+
+        for request_id, (tool, field, case, invalid) in enumerate(EDGE_CASE_TABLE, start=100):
+            label = f"{tool}.{field} {case.id}"
+            envelope = f'{{"jsonrpc":"2.0","id":{request_id},"method":"tools/call","params":'
+            params = f'{{"name":"{tool}","arguments":{arguments_text(tool, field, case.json)}}}'
+            server.send_line((envelope + params + "}").encode())
+            reply = server.receive()
+
+            if case.json in NON_STANDARD_JSON:
+                assert (reply["id"], reply["error"]["code"]) == (None, -32700), label
+            elif invalid:
+                assert reply["id"] == request_id, label
+                assert reply["error"]["code"] == -32602, label
+                assert [e["field"] for e in reply["error"]["data"]["errors"]] == [field], label
+            else:
+                assert reply["id"] == request_id, label
+                assert "result" in reply, label  # valid input (an unknown customer is isError)
 
         assert server.close_stdin_and_wait() == 0
 
