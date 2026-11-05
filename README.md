@@ -8,7 +8,7 @@ its own. The subpackages never import each other.
 |---|---|---|---|
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Done |
-| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Planned |
+| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | In progress: redactor done |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
 
 ## Architecture
@@ -50,7 +50,7 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-ver
 uv sync                              # create .venv and install locked dependencies
 uv run pytest -q                     # every test
 uv run pytest tests/mcp_server -q    # one task at a time
-uv run pytest -m "not e2e" -q        # skip subprocess and real-server tests
+uv run pytest -m "not e2e and not slow" -q   # skip subprocess, real-server and timing tests
 uv run ruff check                    # lint
 ```
 
@@ -234,6 +234,64 @@ and SSE). It covers:
 - a tool that runs longer than 5 seconds;
 - a client hang-up that cancels the downstream tool.
 
+## Task 3: Streaming LLM gateway with real-time PII redaction
+
+In progress. Done so far: the streaming redactor, `ai_gateway.llm_gateway.redaction`. The gateway endpoint, the
+upstream client and the mock provider come next.
+
+### What is redacted
+
+| Kind | Shape | Example |
+|---|---|---|
+| Email | ASCII `local@domain.tld`; local part 1 to 64 characters, TLD 2 to 24 letters | `john.doe@example.com` |
+| SSN | `ddd-dd-dddd` or `ddd dd dddd` (one separator style), and nine bare digits that can be an SSN (area not 000 or 666, group not 00, serial not 0000) | `123-45-6789`, `123456789` |
+| Card | 13 to 19 digits, optionally with single spaces or hyphens between them | `4111 1111 1111 1111` |
+
+Detection is by shape, because redacting too much is the safe direction. So `1234 5678 9012 3456` is redacted even
+though it fails the Luhn check, and so is the SSA example number `987-65-4321`. Two options trade recall for
+precision. `card_luhn` redacts only numbers that start with 2 to 6 and pass the Luhn check. `bare_ssn=False` leaves
+bare nine-digit numbers alone.
+
+### Redacting a stream without buffering it
+
+PII can be split across deltas: `"Mail john.do"`, then `"e@example.com now"`. Releasing each delta as it arrives
+would leak `john.do`, and buffering the whole response would defeat streaming. The redactor holds back only the
+end of the text that could still become part of a match:
+
+- Each pattern family has a closed alphabet and a maximum length. Emails use letters, digits and `._%+-@`, and are
+  at most 342 characters long. SSNs and cards use digits, spaces and hyphens, and are at most 37 characters long.
+- A match that later text could still change must lie in the trailing run of its family's alphabet, within its
+  maximum length of the end. Everything before that point is final, so it is redacted and released at once.
+- Matching is tried only where a match can start: at a digit not preceded by a digit, or at most 64 characters
+  before an `@`. Each position is examined once.
+
+For the example above, the client receives `"Mail "`, then `"[REDACTED] "`. The word `now` follows with the next
+delta or at the end of the stream, because it could still be the start of an email address. Ordinary prose is
+released about one token late for the same reason.
+
+### Guarantees, and how they are tested
+
+- **The way the text is split does not matter.** For any text split into any deltas, the streamed output equals
+  redacting the whole text at once, and nothing released is ever taken back. Hypothesis checks this on random texts
+  and random splits, and a unit test splits each kind of PII at every offset.
+- **The rules are exactly the documented ones.** Batch output matches an independent reference implementation,
+  and, without Luhn, a plain `re.sub` with the same pattern.
+- **Bounded memory.** At most 342 characters are held back, whatever the size of the deltas.
+- **Fast on adversarial input.** 1 MB fed in 1 to 4 character deltas takes 0.4 to 1 s for digits, email-like
+  text, card-like text, JWT-like text and prose (`uv run pytest -m slow`).
+- **The holdback's assumptions hold.** A test walks the parsed patterns. Every character they can consume belongs
+  to their family's alphabet, every lookbehind is one character wide, and every match length is bounded.
+
+### Known limits
+
+- Non-ASCII, quoted and IP-literal email addresses are not detected. A local part over 64 characters leaves its
+  first characters visible.
+- Next to other digit groups, shapes cannot tell where a number ends. An extra group can stay visible
+  (`ref 1234 4111 1111 1111 1111` becomes `ref [REDACTED] 1111`), and a card-shaped run can absorb the first digits
+  of an adjacent SSN, leaving its last four visible.
+- At the normal end of a stream, an unfinished fragment is released as it is, since `john.doe@exa` is not an email
+  address. When a stream is cut off by an error, the held-back text is dropped instead.
+
 ## Requirements versus implementation choices
 
 The assessment leaves some details open. These are the choices made, and why:
@@ -265,6 +323,9 @@ The assessment leaves some details open. These are the choices made, and why:
 - **Cancellation on client hang-up depends on the downstream.** The gateway always closes its downstream request
   when the client disconnects. An SDK server answering with event streams then cancels the tool. In its JSON-response
   mode, the SDK does not watch for disconnects, so the tool runs to completion.
+- **PII is detected by shape, not validated.** The brief names emails, SSNs and credit card numbers without
+  defining their formats. Shape matching redacts some numbers that are not real cards or SSNs, which is the safe
+  direction for a privacy filter. Luhn validation is available as an option.
 
 ## Project layout
 
@@ -276,5 +337,6 @@ src/ai_gateway/
 └── model_router/   # Task 4
 tests/
 ├── mcp_server/     # one folder per task, added as each task is built
-└── mcp_gateway/
+├── mcp_gateway/
+└── llm_gateway/
 ```

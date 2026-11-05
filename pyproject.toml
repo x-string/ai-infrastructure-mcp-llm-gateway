@@ -48,6 +48,7 @@ select = ["E", "W", "F", "I", "B", "UP", "T20"]
 [dependency-groups]
 dev = [
     "anyio>=4.16",
+    "hypothesis>=6.170",
     "pytest>=9.2",
     "ruff>=0.17.4",
 ]
