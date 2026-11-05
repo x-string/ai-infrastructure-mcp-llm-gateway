@@ -6,7 +6,7 @@ its own. The subpackages never import each other.
 
 | Task | Package | What it does | Status |
 |---|---|---|---|
-| 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | In progress: server and error mapping done, stdio entry point next |
+| 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Planned |
 | 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Planned |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
@@ -50,15 +50,36 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-ver
 uv sync                              # create .venv and install locked dependencies
 uv run pytest -q                     # every test
 uv run pytest tests/mcp_server -q    # one task at a time
+uv run pytest -m "not e2e" -q        # skip subprocess and real-server tests
 uv run ruff check                    # lint
 ```
 
 ## Task 1: MCP server with strict validation
 
-Status: the tool models (`schemas.py`) and the MCP server with its error mapping (`server.py`) are done.
-The stdio entry point comes next.
+### Run it
 
-Tools:
+```bash
+uv run t1-mcp-server                 # or: uv run python -m ai_gateway.mcp_server
+```
+
+The server speaks MCP over stdin and stdout, so it is normally started by an MCP host. To try it from a shell:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer_record","arguments":{"customer_id":"CUST-00042"}}}' \
+  | uv run t1-mcp-server 2>/dev/null
+```
+
+- With MCP Inspector: `npx @modelcontextprotocol/inspector uv --directory "$PWD" run t1-mcp-server`.
+- In an MCP host such as Claude Desktop:
+  `{"mcpServers": {"customer-records": {"command": "uv", "args": ["--directory", "/absolute/path/to/repo", "run", "t1-mcp-server"]}}}`.
+- Logs go to stderr. Set `MCP_SERVER_LOG_LEVEL=DEBUG` for more detail.
+
+Demo customers: `CUST-00042`, `CUST-01815`, `CUST-12345`. The data is fictional and kept in memory.
+
+### Tools
 
 - **`get_customer_record`**: returns the customer's profile as structured content.
 - **`trigger_refund`**: records a refund and returns a receipt.
@@ -96,6 +117,35 @@ returns
 Error details never echo submitted values. The names of unexpected keys are shown only when they look like
 ordinary identifiers. Unexpected exceptions are wrapped explicitly: without that, the SDK would answer stdio
 clients with `{"code": 0, "message": "<exception text>"}`, which leaks internals. A test reproduces that leak.
+
+### The stdio transport
+
+The SDK's `stdio_server()` keeps the protocol on a private copy of stdout and points fd 1 at stderr while
+serving. Its stdin handling is too lenient, though, so `stdio_transport.py` reads stdin itself:
+
+| Input line | Reply |
+|---|---|
+| Blank | Ignored |
+| Not JSON, not UTF-8, `NaN`/`Infinity` literal, duplicate keys | `-32700 Parse error`, `"id": null` |
+| Batch array; `id` that is `null`, a boolean or a float; missing `"jsonrpc": "2.0"`; line over 1 MiB | `-32600 Invalid Request`, with the `id` echoed when it is valid |
+| A request whose `params` is not an object | `-32602 Invalid params` |
+| `tools/call` before `initialize` | `-32602` (from the SDK) |
+| Unknown method | `-32601 Method not found` (from the SDK) |
+
+What the transport adds:
+
+- **End-of-input drain.** When stdin closes, pending requests get up to 1.5 seconds to finish before the
+  server shuts down, so a host that pipes requests and closes stdin gets every reply.
+- **Stray-output guard.** While serving, `sys.stdout` is redirected to stderr, and the original stream is
+  flushed before fd 1 is restored. Buffered stray output therefore cannot reach the protocol stream at exit.
+
+Measured against the SDK's plain `stdio_server()`, same server, same piped input (20 tool calls, then two
+malformed lines; the end-to-end tests cover each behavior):
+
+| | Tool replies | Errors for malformed lines | Stray text on stdout |
+|---|---|---|---|
+| Plain `stdio_server()` | 11 to 12 of 20 | 0 of 2 (the client waits forever) | Yes |
+| This transport | 20 of 20 | 2 of 2 | No |
 
 ## Requirements versus implementation choices
 
