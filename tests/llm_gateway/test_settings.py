@@ -13,7 +13,7 @@ def test_defaults_point_at_the_local_mock_provider() -> None:
     assert settings.upstream.url == DEFAULT_UPSTREAM_URL
     assert settings.upstream.api_key is None
     assert settings.rules == RedactionRules(bare_ssn=True, card_luhn=False)
-    assert (settings.host, settings.port, settings.max_streams) == ("127.0.0.1", 8300, 100)
+    assert (settings.host, settings.port, settings.max_streams) == ("127.0.0.1", 8200, 100)
     assert settings.upstream.max_connections == settings.max_streams
 
 

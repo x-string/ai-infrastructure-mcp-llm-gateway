@@ -10,7 +10,7 @@
 | ``T3_MAX_STREAM_SECONDS`` | ``600`` | a stream still running after this ends with an error |
 | ``T3_FIRST_EVENT_TIMEOUT`` | ``60`` | seconds from the request to the provider's first event |
 | ``T3_READ_TIMEOUT`` | ``120`` | the longest silence allowed from the provider, in seconds |
-| ``T3_HOST`` / ``T3_PORT`` | ``127.0.0.1`` / ``8300`` | where the gateway listens |
+| ``T3_HOST`` / ``T3_PORT`` | ``127.0.0.1`` / ``8200`` | where the gateway listens |
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class GatewaySettings:
     max_body_bytes: int = 1 << 20
     keepalive_seconds: float = 15.0  # relay the provider's keep-alives at most this often
     host: str = "127.0.0.1"
-    port: int = 8300
+    port: int = 8200
 
     def __post_init__(self) -> None:
         if self.max_streams < 1:
@@ -64,7 +64,7 @@ class GatewaySettings:
             max_streams=max_streams,
             max_stream_seconds=_number(env, "T3_MAX_STREAM_SECONDS", 600.0),
             host=env.get("T3_HOST") or "127.0.0.1",
-            port=_integer(env, "T3_PORT", 8300),
+            port=_integer(env, "T3_PORT", 8200),
         )
 
 

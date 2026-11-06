@@ -115,7 +115,7 @@ async def call(
         "root_path": "",
         "headers": exchange.headers,
         "client": ("127.0.0.1", 50000),
-        "server": ("127.0.0.1", 8300),
+        "server": ("127.0.0.1", 8200),
     }
     with anyio.fail_after(GUARD):
         await app(scope, exchange.receive, exchange.send)
