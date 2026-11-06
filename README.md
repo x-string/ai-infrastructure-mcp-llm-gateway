@@ -8,7 +8,7 @@ its own. The subpackages never import each other.
 |---|---|---|---|
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Done |
-| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | In progress: redactor done |
+| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | In progress: redactor and upstream client done |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
 
 ## Architecture
@@ -236,8 +236,8 @@ and SSE). It covers:
 
 ## Task 3: Streaming LLM gateway with real-time PII redaction
 
-In progress. Done so far: the streaming redactor, `ai_gateway.llm_gateway.redaction`. The gateway endpoint, the
-upstream client and the mock provider come next.
+In progress. Done so far: the streaming redactor (`ai_gateway.llm_gateway.redaction`), and reading the upstream
+stream (`sse`, `events` and `upstream`). The gateway endpoint and the mock provider come next.
 
 ### What is redacted
 
@@ -292,6 +292,61 @@ released about one token late for the same reason.
 - At the normal end of a stream, an unfinished fragment is released as it is, since `john.doe@exa` is not an email
   address. When a stream is cut off by an error, the held-back text is dropped instead.
 
+### Reading the upstream stream
+
+The gateway reads the provider's Server-Sent Events with its own decoder (`sse.py`). httpx2's built-in `EventSource`
+drops comments, replaces invalid UTF-8, decodes with whatever charset the server declares, and checks its size limit
+only after buffering a chunk. Its `aiter_lines()` also splits on U+2028 and U+0085. The decoder follows the WHATWG
+rules with stricter input handling:
+
+- lines end at CR, LF or CRLF only, including a CRLF split across network chunks;
+- every line is strict UTF-8, and invalid bytes are an error;
+- a line or an event over 1 MiB is an error, refused before it is buffered;
+- comments are kept, as proof that the provider is alive;
+- an event cut off by the end of the stream is discarded, as the spec and the OpenAI SDK do.
+
+Upstream chunks are never forwarded. The gateway rebuilds every chunk it sends from normalized events (`events.py`),
+so only text it understands reaches the client, and all of that text goes through the redactor:
+
+| In the upstream delta | What happens |
+|---|---|
+| `content` (a string, or Mistral's list of text parts) and `refusal` | Relayed, redacted, each with its own redactor |
+| `reasoning`, `reasoning_content` and similar | Dropped |
+| `tool_calls`, `function_call`, `audio`, `images` | Refused: the request cannot ask for them, and they could not be redacted as text |
+| `role`, `annotations`, `citations` and other known metadata | Ignored |
+| Any other field with a value | Refused, since it could be a text channel the gateway does not know |
+
+An error object (top-level `error`, `object: "error"`, Groq's `x_groq.error`), an `event: error`, or an error finish
+reason (`error`, `abort`, ...) means the generation failed. Finish reasons map onto OpenAI's `stop`, `length` and
+`content_filter`. A stream succeeds only once a finish reason has arrived: `[DONE]` alone does not prove it, and a
+truncated stream fails closed. The normalizer is tested against 55 provider-shaped streams, each with its source:
+OpenAI, Azure OpenAI, vLLM, llama.cpp, Ollama, LiteLLM, OpenRouter, Groq, DeepSeek, Mistral, Together, Fireworks,
+Gemini, TGI, SGLang, plus shapes that must fail closed.
+
+### Upstream failures
+
+`open_stream` returns only once the first event has arrived and been checked, so until then the client still gets a
+proper HTTP error. No upstream body is ever passed on, since it can echo the prompt. The `x-should-retry` header tells
+the OpenAI SDKs whether retrying can help; otherwise they retry 408, 409, 429 and 5xx:
+
+| Upstream | Client | Code | Retry |
+|---|---|---|---|
+| 429 | 429 with `Retry-After` | `upstream_rate_limited` | yes |
+| 503, 529 | 503 with `Retry-After` | `upstream_overloaded` | yes |
+| 408, 504, or any timeout | 504 | `upstream_timeout` | yes |
+| 400, 404, 413, 422 | 400 | `upstream_rejected_request` | no |
+| 401, 403 (the gateway's own key) | 502 | `upstream_auth_failed` | no |
+| Other 5xx, 409, connection failures | 502 | `upstream_unavailable` | yes |
+| Not a 200 event stream; invalid or unexpected data | 502 | `upstream_protocol_error` | no |
+| An error reported in the stream | 502 | `upstream_error` | no |
+| Connection pool exhausted | 503 | `gateway_overloaded` | yes |
+
+The client connects with explicit timeouts: 5 s to connect, at most 120 s of silence between bytes, and 60 s from
+the request to the first event. It ignores proxy settings from the environment, never follows redirects (that would
+send the API key elsewhere), and asks for an uncompressed stream. Real-socket tests cover a refused connection, a
+server that never answers, silence mid-stream, truncated chunked and unframed bodies, a connection reset, and a full
+connection pool.
+
 ## Requirements versus implementation choices
 
 The assessment leaves some details open. These are the choices made, and why:
@@ -326,6 +381,11 @@ The assessment leaves some details open. These are the choices made, and why:
 - **PII is detected by shape, not validated.** The brief names emails, SSNs and credit card numbers without
   defining their formats. Shape matching redacts some numbers that are not real cards or SSNs, which is the safe
   direction for a privacy filter. Luhn validation is available as an option.
+- **Only text the gateway understands is relayed.** The brief asks for redaction "in real time" but says nothing
+  about channels other than the text. Tool calls, audio and unknown delta fields are refused rather than passed on,
+  and reasoning text is dropped, so nothing reaches the client without going through the redactor.
+- **A stream must end with a finish reason to count as complete.** Some providers send `[DONE]` after an error or
+  a cut-off, so `[DONE]` alone is not trusted.
 
 ## Project layout
 
