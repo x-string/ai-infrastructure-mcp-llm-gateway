@@ -9,7 +9,7 @@ its own. The subpackages never import each other.
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Done |
 | 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Done |
-| 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
+| 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Done |
 
 ## Architecture
 
@@ -434,6 +434,151 @@ the first chunk leaving while the provider is still blocked, both kinds of disco
 freeing the stream slot, the 503 when every slot is taken, and that the logs hold no prompt or reply text. Every
 chunk the relay produces is validated against the OpenAI SDK's own `ChatCompletionChunk` type in strict mode.
 
+## Task 4: Token-aware rate limiter with model failover
+
+A non-streaming, OpenAI-compatible `POST /v1/chat/completions`. Each tenant has a budget of tokens per minute,
+enforced over a sliding 60-second window kept in SQLite on disk. Requests go to a primary provider, and fail over
+to a secondary when the primary answers 429 or has not delivered its whole response within 3,000 ms.
+
+### Run it
+
+```bash
+uv run t4-tenants add acme --tokens-per-minute 3000     # prints acme's API key, once
+uv run t4-mock-provider --port 9201 --name primary --mode rate_limited --control
+uv run t4-mock-provider --port 9202 --name secondary
+uv run t4-router                                        # 127.0.0.1:8300, tenants and usage in t4-router.db
+
+curl -si http://127.0.0.1:8300/v1/chat/completions -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model": "gpt-test", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+From a real run: the primary answers 429, so the secondary serves the request.
+
+```
+HTTP/1.1 200 OK
+x-gateway-provider: secondary
+x-ratelimit-limit-tokens: 3000
+x-ratelimit-remaining-tokens: 2987
+x-request-id: req_1de96f40363846ffaea4c2525c02b874
+{"id":"chatcmpl-secondary-...","object":"chat.completion","created":1793930134,"model":"gpt-test",
+ "choices":[{"index":0,"message":{"role":"assistant","content":"[secondary] Hello"},"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}
+```
+
+Then, with the primary answering after 2 s (`curl -X PUT http://127.0.0.1:9201/_mode -d '{"mode": "slow",
+"delay": 2}'`), four concurrent requests with `"max_tokens": 1000` hold reservations at the same time. Two fit in
+the 3,000-token budget and two get `429` with `Retry-After: 60`. A request that could never fit is refused at once:
+
+```json
+{"error":{"type":"invalid_request_error","code":"request_too_large","message":"The request may use up to 4039 tokens, more than the tenant limit of 3000 tokens per minute. Send a shorter prompt or a lower max_tokens.","request_id":"req_ac11319b4a6847daa08df0a66e610f13"}}
+```
+
+The mock provider's other modes are `ok`, `slow_drip` (headers at once, the body slowly), `error`, `malformed` and
+`no_usage`. The router is configured with `T4_*` variables (see `.env.example`). The main ones are `T4_DB_PATH`, and
+`T4_PRIMARY_URL`, `T4_PRIMARY_API_KEY` and `T4_PRIMARY_DEADLINE_MS` (3000) with their `T4_SECONDARY_*` equivalents
+(15000 ms for the deadline). `T4_DEFAULT_MAX_TOKENS` (1024) and `T4_MAX_OUTPUT_TOKENS` (4096) bound the completion
+cap.
+
+### How a request is handled
+
+| Step | Rejected with |
+|---|---|
+| 1. `Authorization: Bearer <tenant key>`, looked up by its SHA-256 digest, before the body is read | 401 with a `WWW-Authenticate` challenge |
+| 2. `Content-Type: application/json`, body at most 1 MiB | 415 / 413 |
+| 3. Strict JSON (no duplicate keys, no `NaN`) and a strict request model: text messages only, no tools, no streaming, `n` = 1, at most one of `max_tokens` and `max_completion_tokens` (default 1024, at most 4096) | 400, naming the fields but never echoing input |
+| 4. The cost estimate (prompt estimate plus the completion cap) must fit the tenant's whole budget | 400 `request_too_large` |
+| 5. Atomic admission in the tenant's 60-second window | 429 with `Retry-After` and `X-RateLimit-*` |
+| 6. The providers in order, each within its total deadline | see the failover table |
+| 7. Settlement: the reservation is replaced by what the request really cost | never changes the response |
+
+The completion cap is always sent to the provider, so the reservation is a real upper bound. The prompt estimate
+errs high: three ASCII characters per token, one token per other character, over the exact JSON sent, plus a fixed
+overhead per message.
+
+### The token window
+
+- **Storage.** One SQLite connection per process, used only from one worker thread, in FIFO order. No query blocks
+  the event loop. WAL journaling is checked at startup, and the router refuses to start without it. Every write
+  starts with `BEGIN IMMEDIATE`, which serializes threads and processes alike.
+- **Admission is one transaction.** Rows dated in the future (the clock stepped back) are moved to now, rows older
+  than 60 s are deleted, the rest are summed, and the request is either reserved in full or denied. A row exactly
+  60 seconds old no longer counts.
+- **`Retry-After` is exact.** It is the whole seconds until enough of the oldest rows have left the window, so it is
+  both sufficient (retrying then succeeds, without new traffic) and tight (a second earlier fails).
+- **Fails closed.** If SQLite errors, or stays locked for more than 2 s, the answer is 503 `limiter_unavailable` and
+  nothing is sent to a provider.
+- **Charging.** A request is settled exactly once:
+  - an attempt that never reached its provider, or got 429, costs nothing;
+  - an attempt that timed out, failed with a 5xx or broke after sending costs its prompt estimate, so provoking
+    timeouts does not buy free tokens;
+  - the successful attempt costs the provider's own usage, or the whole reservation when usage is missing or not
+    believable.
+- **Cancellation and restarts.** If the client goes away while the admission is queued, it is withdrawn, or released
+  right after it runs, so no reservation is left behind. The window survives a restart, because it is on disk.
+
+### Failover
+
+Each attempt has a total deadline covering connecting, the headers and the whole body: 3,000 ms for the primary,
+15,000 ms for the secondary. httpx2's per-read timeout is off, so a provider that drips its body slowly cannot keep
+resetting it. Vendor-side retries are off. The client sees the outcome of the last attempt:
+
+| Last attempt | Status | Code | Fails over |
+|---|---|---|---|
+| Timed out | 504 | `upstream_timeout` | yes |
+| 429 | 503 | `upstream_unavailable` (429 is kept for the tenant's own limit) | yes |
+| 5xx, connection failure, broken or invalid response | 502 | `upstream_error` | yes |
+| 400, 413, 422 | 400 | `upstream_rejected_request` | no: the next provider would reject it too |
+| 401, 403, 404 and other 4xx | 502 | `upstream_configuration_error` | no |
+
+A successful response is rebuilt as a plain `chat.completion`. Upstream bodies, which can echo the prompt, never
+reach the client or the logs. Logs record the provider, outcome, status and time of each attempt, and the tokens
+charged.
+
+### Errors
+
+Every response carries a server-generated `X-Request-ID`. Every error, including routing errors and unexpected
+exceptions, uses one payload, with no stack trace and no upstream body:
+
+```json
+{"error": {"type": "rate_limit_error", "code": "tenant_token_limit_exceeded",
+           "message": "The tenant limit of 3000 tokens per minute is reached; retry after 60 s.",
+           "request_id": "req_..."}}
+```
+
+| Status | Type | Codes |
+|---|---|---|
+| 400 | `invalid_request_error` | `invalid_json`, `invalid_request`, `conflicting_max_tokens`, `max_tokens_too_large`, `request_too_large`, `upstream_rejected_request` |
+| 401 | `authentication_error` | `missing_api_key`, `invalid_api_key` |
+| 404, 405 | `invalid_request_error` | `not_found`, `method_not_allowed` |
+| 413, 415 | `invalid_request_error` | `body_too_large`, `unsupported_media_type` |
+| 429 | `rate_limit_error` | `tenant_token_limit_exceeded` |
+| 500 | `server_error` | `internal_error` |
+| 502 | `upstream_error` | `upstream_error`, `upstream_configuration_error` |
+| 503 | `server_error`, `upstream_error` | `limiter_unavailable`, `upstream_unavailable` |
+| 504 | `upstream_error` | `upstream_timeout` |
+
+### Tested end to end
+
+- `tests/model_router/test_e2e.py` runs the router and two mock providers as processes, with the tenant created by
+  `t4-tenants`. It covers:
+  - failover to the secondary when the primary is rate limited, slow, dripping its body, failing or malformed
+    (the slow modes give up at the deadline, not after the 3 s the primary would take);
+  - a clean 502 when both providers fail;
+  - a concurrent burst that gets exactly two 200s and three 429s with `Retry-After`;
+  - the window surviving a router restart;
+  - unknown keys refused before any provider is called.
+- **Contention.** Threads, and separate processes started with `spawn`, race on one database file behind a
+  barrier with a shared clock. Exactly `limit // cost` requests are admitted, and no worker sees "database is
+  locked".
+- **A reference model.** Hypothesis compares the limiter with a brute-force model, including the 59,999 ms and
+  60,000 ms boundaries, clock steps and settlements. `Retry-After` matches the model's smallest sufficient wait.
+- **Deadlines** (50 ms in the tests): a hang, slow headers, a slow-drip body and an answer right at the deadline.
+  Each gives exactly one response and one settlement. So do every failover path, cancellation mid-attempt, and a
+  settlement that fails.
+- **Sanitization**, with `raise_server_exceptions=False`: upstream bodies holding secrets, an unexpected exception,
+  a broken database, validation errors carrying PII in values and field names, and routing errors.
+
 ## Requirements versus implementation choices
 
 The assessment leaves some details open. These are the choices made, and why:
@@ -473,6 +618,23 @@ The assessment leaves some details open. These are the choices made, and why:
   and reasoning text is dropped, so nothing reaches the client without going through the redactor.
 - **A stream must end with a finish reason to count as complete.** Some providers send `[DONE]` after an error or
   a cut-off, so `[DONE]` alone is not trusted.
+- **"Times out after 3000ms" is a deadline for the whole response.** Connecting, the headers and the full body must
+  all arrive within 3 s, so a provider that answers headers fast and then stalls still fails over. A streaming
+  router would apply the deadline to the time to first token instead.
+- **Failover also covers connection failures, 5xx and invalid responses.** The brief names 429 and timeouts. Other
+  transient failures fail over too, but a provider's 400-class rejection does not, since the secondary would reject
+  the same request.
+- **"Token-aware" means reserve an upper estimate, then settle.** Tokens are only known after the response, so
+  admission reserves the prompt estimate plus the completion cap (which is always sent), and settlement records the
+  provider's usage. Reservations never exceed the limit at admission; afterwards, usage can only exceed it by the
+  estimation error of requests still in flight.
+- **A provider's 429 becomes a 503 for the client.** 429 is kept for the tenant's own limit, so a client can tell
+  "you are over your budget" from "the providers are busy".
+- **Tenants are API keys in the same SQLite file, stored as SHA-256 digests.** Usage is counted per tenant, not per
+  key, so rotating keys does not reset the window. Unknown keys get 401.
+- **Timeouts and 5xx after sending are charged the prompt estimate.** Otherwise a client could provoke timeouts to
+  get free tokens. Attempts that never reached a provider, or got 429, cost nothing.
+- **Invalid requests get 400, not FastAPI's 422.** That is what OpenAI-compatible clients expect.
 
 ## Project layout
 
@@ -485,5 +647,6 @@ src/ai_gateway/
 tests/
 ├── mcp_server/     # one folder per task, added as each task is built
 ├── mcp_gateway/
-└── llm_gateway/
+├── llm_gateway/
+└── model_router/
 ```

@@ -20,6 +20,9 @@ t2-mint-jwt = "ai_gateway.mcp_gateway.mint_jwt:main"
 t2-mock-downstream = "ai_gateway.mcp_gateway.mock_downstream:main"
 t3-gateway = "ai_gateway.llm_gateway.__main__:main"
 t3-mock-provider = "ai_gateway.llm_gateway.mock_provider:main"
+t4-router = "ai_gateway.model_router.__main__:main"
+t4-mock-provider = "ai_gateway.model_router.mock_provider:main"
+t4-tenants = "ai_gateway.model_router.tenants:main"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13"]
