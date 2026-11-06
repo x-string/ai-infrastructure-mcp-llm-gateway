@@ -8,7 +8,7 @@ its own. The subpackages never import each other.
 |---|---|---|---|
 | 1 | `ai_gateway.mcp_server` | MCP server over stdio with strict input validation | Done |
 | 2 | `ai_gateway.mcp_gateway` | MCP security gateway: bearer-token roles, tool-level authorization | Done |
-| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | In progress: redactor and upstream client done |
+| 3 | `ai_gateway.llm_gateway` | Streaming LLM gateway with real-time PII redaction | Done |
 | 4 | `ai_gateway.model_router` | Token-aware rate limiter on SQLite with primary-to-backup failover | Planned |
 
 ## Architecture
@@ -236,8 +236,75 @@ and SSE). It covers:
 
 ## Task 3: Streaming LLM gateway with real-time PII redaction
 
-In progress. Done so far: the streaming redactor (`ai_gateway.llm_gateway.redaction`), and reading the upstream
-stream (`sse`, `events` and `upstream`). The gateway endpoint and the mock provider come next.
+An OpenAI-compatible `POST /v1/chat/completions` that forwards streaming generation requests to a provider and
+streams the reply back with emails, SSNs and card numbers replaced by `[REDACTED]`, as the text arrives.
+
+### Run it
+
+```bash
+uv run t3-mock-provider          # terminal 1: a mock provider on 127.0.0.1:9100 that echoes the prompt
+uv run t3-gateway                # terminal 2: the gateway on 127.0.0.1:8300
+curl -N http://127.0.0.1:8300/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model": "echo", "messages": [{"role": "user", "content": "Mail john.doe@example.com now"}]}'
+```
+
+The mock streams three characters at a time, so the address arrives split across several deltas. The client still
+gets it only as `[REDACTED]` (output of the command above, ids shortened):
+
+```
+data: {"id":"chatcmpl-f5Xa…","object":"chat.completion.chunk","created":1793929315,"model":"echo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+data: {…"choices":[{"index":0,"delta":{"content":"Mail "},…}]}
+data: {…"choices":[{"index":0,"delta":{"content":"[REDACTED] "},…}]}
+data: {…"choices":[{"index":0,"delta":{"content":"now"},…}]}
+data: {…"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+data: [DONE]
+```
+
+Any OpenAI SDK works as the client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8300/v1", api_key="unused")
+for chunk in client.chat.completions.create(
+    model="echo", stream=True, messages=[{"role": "user", "content": "SSN 123-45-6789"}]
+):
+    print(chunk.choices[0].delta.content or "", end="")  # SSN [REDACTED]
+```
+
+To use a real provider, point the gateway at it:
+`T3_UPSTREAM_URL=https://api.openai.com/v1/chat/completions T3_UPSTREAM_API_KEY=sk-... uv run t3-gateway`. All
+variables are listed in `.env.example`. The mock picks its behaviour from the request's `model`: `echo`, `pii`,
+`status-429` (or any status), `midstream-error`, `hang`, `slow-headers`, `garbage` and `tool-calls`.
+
+### The endpoint
+
+Every response passes through the redactor, so the gateway only accepts requests whose output is text it can see:
+
+| Request | Answer |
+|---|---|
+| `stream` absent or `true` | streamed (a missing `stream` means streaming) |
+| `stream: false` | 400: there is no unredacted, non-streaming path |
+| `tools`, `functions`, `tool_choice`, `parallel_tool_calls` | 400: tool-call arguments are JSON text with escapes, not redactable text |
+| `logprobs`, `top_logprobs` | 400: alternative tokens would bypass the redactor |
+| `audio`, `modalities` other than `["text"]`, `prediction`, `web_search_options` | 400 |
+| `n` other than 1, or any other unknown parameter | 400, naming the parameter |
+| Not JSON, or not `application/json` / over 1 MiB | 400 / 415 / 413 |
+| More than `T3_MAX_STREAMS` streams running | 503 with `Retry-After: 1` |
+
+Values that ask for nothing (`logprobs: false`, `tools: []`, `modalities: ["text"]`) are accepted and dropped. The
+request sent upstream is rebuilt from the validated fields, with the gateway's own provider key: the client's
+`Authorization` header is never forwarded. Errors have OpenAI's shape, `{"error": {"message", "type", "code",
+"param"}}`, never echo the input, and carry `X-Request-ID`.
+
+The reply is built by the gateway, never forwarded from the provider. It is a role chunk, the redacted content and
+refusal chunks (each channel has its own redactor), one finish chunk, a usage chunk when the client asked for
+`stream_options.include_usage`, then `data: [DONE]`. All chunks share one `id`, `created` and `model`. Until the
+provider's first event arrives, failures are proper HTTP errors (table below). After that, a failure discards the
+held-back text, which may be the start of PII, and ends the stream with one `data: {"error": ...}` frame and no
+`[DONE]`; the OpenAI SDKs raise `APIError` for it. A client that disconnects stops the provider's generation, and
+each stream is limited to `T3_MAX_STREAM_SECONDS`. One log line per stream records the outcome and the number of
+redactions, never text from the prompt or the reply.
 
 ### What is redacted
 
@@ -346,6 +413,26 @@ the request to the first event. It ignores proxy settings from the environment, 
 send the API key elsewhere), and asks for an uncompressed stream. Real-socket tests cover a refused connection, a
 server that never answers, silence mid-stream, truncated chunked and unframed bodies, a connection reset, and a full
 connection pool.
+
+### Tested end to end
+
+`tests/llm_gateway/test_e2e.py` starts the gateway and the mock provider as processes and drives them with the
+official OpenAI Python SDK over TCP:
+
+- the reply arrives redacted and incrementally: the first text comes well before the end, with usage when asked;
+- the SDK's `chat.completions.stream()` helper accepts the rebuilt chunks;
+- a provider 429 reaches the SDK as `RateLimitError` with `Retry-After`, and a bad gateway key as a 502 with
+  `x-should-retry: false`;
+- an error mid-stream raises `APIError`, and the held-back `john.do` never reaches the client;
+- tool calls, invalid events and a provider that stops sending end with an error frame; one that never answers
+  gets a 504 at the first-event deadline;
+- a refused parameter gets a 400 naming it;
+- a client that hangs up mid-stream makes the gateway close the provider's stream.
+
+In-process tests drive the ASGI app directly, because httpx2's `ASGITransport` buffers whole responses. They show
+the first chunk leaving while the provider is still blocked, both kinds of disconnect closing the provider and
+freeing the stream slot, the 503 when every slot is taken, and that the logs hold no prompt or reply text. Every
+chunk the relay produces is validated against the OpenAI SDK's own `ChatCompletionChunk` type in strict mode.
 
 ## Requirements versus implementation choices
 

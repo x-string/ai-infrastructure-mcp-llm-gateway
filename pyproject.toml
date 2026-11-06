@@ -18,6 +18,8 @@ t1-mcp-server = "ai_gateway.mcp_server.__main__:main"
 t2-gateway = "ai_gateway.mcp_gateway.__main__:main"
 t2-mint-jwt = "ai_gateway.mcp_gateway.mint_jwt:main"
 t2-mock-downstream = "ai_gateway.mcp_gateway.mock_downstream:main"
+t3-gateway = "ai_gateway.llm_gateway.__main__:main"
+t3-mock-provider = "ai_gateway.llm_gateway.mock_provider:main"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13"]
@@ -49,6 +51,7 @@ select = ["E", "W", "F", "I", "B", "UP", "T20"]
 dev = [
     "anyio>=4.16",
     "hypothesis>=6.170",
+    "openai>=3.46",
     "pytest>=9.2",
     "ruff>=0.17.4",
 ]
