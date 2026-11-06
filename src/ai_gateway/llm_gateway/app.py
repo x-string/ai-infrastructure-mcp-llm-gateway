@@ -238,7 +238,12 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         record = StreamRecord(request_id=uuid.uuid4().hex)
-        response = await handle(request, record)
+        try:
+            response = await handle(request, record)
+        except StarletteHTTPException as exc:  # the body size limit, raised while reading
+            record.outcome = "rejected"
+            code, message = _STATUS_CODES.get(exc.status_code, ("http_error", "Request failed."))
+            response = error_response(exc.status_code, code, message)
         response.headers["x-request-id"] = record.request_id
         if not isinstance(response, RelayResponse):
             record.emit()

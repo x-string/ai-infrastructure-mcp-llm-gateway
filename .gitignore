@@ -27,3 +27,6 @@ assessment.pdf
 
 # OS
 .DS_Store
+
+# Local Claude Code state (agent worktrees)
+.claude/

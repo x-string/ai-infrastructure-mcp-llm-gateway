@@ -252,7 +252,7 @@ async def test_bad_requests_are_answered_before_the_provider_is_called(
     exchange = await run(upstream, payload, content_type=content_type)
     assert exchange.status == status
     assert exchange.json()["error"]["code"] == code
-    assert "x-request-id" in exchange.response_headers or status == 413
+    assert len(exchange.response_headers["x-request-id"]) == 32
     assert upstream.requests == []
 
 
